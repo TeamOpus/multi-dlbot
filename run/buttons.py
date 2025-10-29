@@ -3,12 +3,12 @@ from run import Button
 
 class Buttons:
     source_code_button = [
-        Button.url("Source Code", url="https://github.com/AdibNikjou/MusicDownloader-Telegram-Bot")]
+        Button.url("Source Code", url="https://github.com/BhootNath")]
 
     main_menu_buttons = [
         [Button.inline("Instructions", b"instructions"), Button.inline("Settings", b"setting")],
         source_code_button,
-        [Button.url("Contact Creator", url="telegram.me/adibnikjou")],
+        [Button.url("Creator", url="telegram.me/x_ifeelram")],
     ]
 
     back_button = Button.inline("<< Back To Main Menu", b"back")
@@ -116,24 +116,24 @@ class Buttons:
             case {'format': 'flac', 'quality': "693"}:
                 return [
                     [Button.inline("◽️ Flac", b"setting/quality/flac")],
-                    [Button.inline("Mp3 (320)", b"setting/quality/mp3/320")],
-                    [Button.inline("Mp3 (128)", b"setting/quality/mp3/128")],
+                    [Button.inline("Mp3 (320kbps)", b"setting/quality/mp3/320")],
+                    [Button.inline("Mp3 (128kbps)", b"setting/quality/mp3/128")],
                     [Buttons.back_button, Buttons.back_button_to_setting],
                 ]
 
             case {'format': "mp3", 'quality': "320"}:
                 return [
                     [Button.inline("Flac", b"setting/quality/flac")],
-                    [Button.inline("◽️ Mp3 (320)", b"setting/quality/mp3/320")],
-                    [Button.inline("Mp3 (128)", b"setting/quality/mp3/128")],
+                    [Button.inline("◽️ Mp3 (320kbps)", b"setting/quality/mp3/320")],
+                    [Button.inline("Mp3 (128kbps)", b"setting/quality/mp3/128")],
                     [Buttons.back_button, Buttons.back_button_to_setting],
                 ]
 
             case {'format': "mp3", 'quality': "128"}:
                 return [
                     [Button.inline("Flac", b"setting/quality/flac")],
-                    [Button.inline("Mp3 (320)", b"setting/quality/mp3/320")],
-                    [Button.inline("◽️ Mp3 (128)", b"setting/quality/mp3/128")],
+                    [Button.inline("Mp3 (320kbps)", b"setting/quality/mp3/320")],
+                    [Button.inline("◽️ Mp3 (128kbps)", b"setting/quality/mp3/128")],
                     [Buttons.back_button, Buttons.back_button_to_setting],
                 ]
 
