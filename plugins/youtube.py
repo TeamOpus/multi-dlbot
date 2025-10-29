@@ -1,3 +1,5 @@
+import aiohttp
+import asyncio
 from utils import YoutubeDL, re, lru_cache, hashlib, InputMediaPhotoExternal, db
 from utils import os, InputMediaUploadedDocument, DocumentAttributeVideo, fast_upload
 from utils import DocumentAttributeAudio, DownloadError, WebpageMediaEmptyError
@@ -14,7 +16,7 @@ class YoutubeDownloader:
         if not os.path.isdir(cls.DOWNLOAD_DIR):
             os.mkdir(cls.DOWNLOAD_DIR)
 
-    @lru_cache(maxsize=128)  # Cache the last 128 screenshots
+    @lru_cache(maxsize=128)
     def get_file_path(url, format_id, extension):
         url = url + format_id + extension
         url_hash = hashlib.blake2b(url.encode()).hexdigest()
@@ -39,7 +41,6 @@ class YoutubeDownloader:
 
     @staticmethod
     def extract_youtube_url(text):
-        # Regular expression patterns to match different types of YouTube URLs
         youtube_patterns = [
             r'(https?\:\/\/)?youtube\.com\/shorts\/([a-zA-Z0-9_-]{11}).*',
             r'(https?\:\/\/)?www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})(?!.*list=)',
@@ -57,7 +58,6 @@ class YoutubeDownloader:
                     return f'https://www.youtube.com/shorts/{video_id}'
                 else:
                     return f'https://www.youtube.com/watch?v={video_id}'
-
         return None
 
     @staticmethod
@@ -80,198 +80,145 @@ class YoutubeDownloader:
         video_id = (youtube_link.split("?si=")[0]
                     .replace("https://www.youtube.com/watch?v=", "")
                     .replace("https://www.youtube.com/shorts/", ""))
-        formats = YoutubeDownloader._get_formats(url)
 
-        # Download the video thumbnail
         with YoutubeDL({'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             thumbnail_url = info['thumbnail']
+            title = info.get('title', 'Unknown Title')
 
-        # Create buttons for each format
-        video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
-        audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-
-        video_buttons = []
-        counter = 0
-        for f in reversed(video_formats):
-            extension = f['ext']
-            resolution = f.get('resolution')
-            filesize = f.get('filesize') if f.get('filesize') is not None else f.get('filesize_approx')
-            if resolution and filesize and counter < 5:
-                filesize = f"{filesize / 1024 / 1024:.2f} MB"
-                button_data = f"yt/dl/{video_id}/{extension}/{f['format_id']}/{filesize}"
-                button = [Button.inline(f"{extension} - {resolution} - {filesize}", data=button_data)]
-                if not button in video_buttons:
-                    video_buttons.append(button)
-                    counter += 1
-
-        audio_buttons = []
-        counter = 0
-        for f in reversed(audio_formats):
-            extension = f['ext']
-            resolution = f.get('resolution')
-            filesize = f.get('filesize') if f.get('filesize') is not None else f.get('filesize_approx')
-            if resolution and filesize and counter < 5:
-                filesize = f"{filesize / 1024 / 1024:.2f}MB"
-                button_data = f"yt/dl/{video_id}/{extension}/{f['format_id']}/{filesize}"
-                button = [Button.inline(f"{extension} - {resolution} - {filesize}", data=button_data)]
-                if not button in audio_buttons:
-                    audio_buttons.append(button)
-                    counter += 1
+        # API-based formats
+        video_buttons = [
+            [Button.inline("🎬 MP4 (Video)", data=f"ytapi/{video_id}/mp4")]
+        ]
+        audio_buttons = [
+            [Button.inline("🎧 MP3 (Audio)", data=f"ytapi/{video_id}/mp3")]
+        ]
 
         buttons = video_buttons + audio_buttons
         buttons.append(Buttons.cancel_button)
 
-        # Set thumbnail attributes
         thumbnail = InputMediaPhotoExternal(thumbnail_url)
         thumbnail.ttl_seconds = 0
 
-        # Send the thumbnail as a picture with format buttons
         try:
             await client.send_file(
                 event.chat_id,
-               file=thumbnail,
-               caption="Select a format to download:",
-               buttons=buttons
-               )
+                file=thumbnail,
+                caption=f"🎵 **{title}**\nSelect a format to download:",
+                buttons=buttons
+            )
         except WebpageMediaEmptyError:
             await event.respond(
-               "Select a format to download:",
-               buttons=buttons
-               )
-
+                f"🎵 **{title}**\nSelect a format to download:",
+                buttons=buttons
+            )
 
     @staticmethod
     async def download_and_send_yt_file(client, event):
         user_id = event.sender_id
 
         if await db.get_file_processing_flag(user_id):
-            return await event.respond("Sorry, There is already a file being processed for you.")
+            return await event.respond("⚙️ Please wait — another file is being processed for you.")
 
         data = event.data.decode('utf-8')
         parts = data.split('/')
-        if len(parts) == 6:
-            extension = parts[3]
-            format_id = parts[-2]
-            filesize = parts[-1].replace("MB", "")
-            video_id = parts[2]
-
-            if float(filesize) > YoutubeDownloader.MAXIMUM_DOWNLOAD_SIZE_MB:
-                return await event.answer(
-                    f"⚠️ The file size is more than {YoutubeDownloader.MAXIMUM_DOWNLOAD_SIZE_MB}MB."
-                    , alert=True)
+        if len(parts) == 3 and parts[0] == 'ytapi':
+            video_id = parts[1]
+            format_type = parts[2]  # mp3 or mp4
 
             await db.set_file_processing_flag(user_id, is_processing=True)
+            waiting_msg = await event.respond(f"🎧 Fetching {format_type.upper()} link, please wait up to 90s...")
 
-            local_availability_message = None
-            url = "https://www.youtube.com/watch?v=" + video_id
+            api_url = f"https://apex.srvopus.workers.dev/arytmp?direct&id={video_id}&format={format_type}"
 
-            path = YoutubeDownloader.get_file_path(url, format_id, extension)
+            # Fetch API response (wait up to 90 seconds)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(api_url, timeout=90) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                        else:
+                            raise Exception(f"API returned {resp.status}")
+            except asyncio.TimeoutError:
+                await db.set_file_processing_flag(user_id, is_processing=False)
+                return await waiting_msg.edit("⏳ API took too long to respond (timeout 90s). Try again.")
+            except Exception as e:
+                await db.set_file_processing_flag(user_id, is_processing=False)
+                return await waiting_msg.edit(f"❌ Failed to fetch download link.\nReason: {str(e)}")
 
-            if not os.path.isfile(path):
-                downloading_message = await event.respond("Downloading the file for you ...")
-                ydl_opts = {
-                    'format': format_id,
-                    'outtmpl': path,
-                    'quiet': True,
-                }
+            # Validate API result
+            if not result.get("status") == "success" or not result.get("download_url"):
+                await db.set_file_processing_flag(user_id, is_processing=False)
+                return await waiting_msg.edit("⚠️ API did not return a valid download URL.")
 
-                with YoutubeDL(ydl_opts) as ydl:
-                    try:
-                        info = ydl.extract_info(url, download=True)
-                        duration = info.get('duration', 0)
-                        width = info.get('width', 0)
-                        height = info.get('height', 0)
-                    except DownloadError as e:
-                        await db.set_file_processing_flag(user_id, is_processing=False)
-                        return await downloading_message.edit(f"Sorry Something went wrong:\nError:"
-                                                              f"  {str(e).split('Error')[-1]}")
-                await downloading_message.delete()
-            else:
-                local_availability_message = await event.respond(
-                    "This file is available locally. Preparing it for you now...")
+            download_url = result["download_url"]
+            title = result.get("title", "Downloaded File")
 
-                ydl_opts = {
-                    'format': format_id,
-                    'outtmpl': path,
-                    'quiet': True,
-                }
-                with YoutubeDL(ydl_opts) as ydl:
-                    try:
-                        info = ydl.extract_info(url, download=False)
-                        duration = info.get('duration', 0)
-                        width = info.get('width', 0)
-                        height = info.get('height', 0)
-                    except DownloadError as e:
-                        await db.set_file_processing_flag(user_id, is_processing=False)
+            path = os.path.join(YoutubeDownloader.DOWNLOAD_DIR, f"{video_id}.{format_type}")
 
-            upload_message = await event.respond("Uploading ... Please hold on.")
+            # Download file from API
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(download_url, timeout=90) as r:
+                        if r.status != 200:
+                            raise Exception(f"Download failed with HTTP {r.status}")
+                        with open(path, 'wb') as f:
+                            while True:
+                                chunk = await r.content.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+            except Exception as e:
+                await db.set_file_processing_flag(user_id, is_processing=False)
+                return await waiting_msg.edit(f"⚠️ Could not download file.\nReason: {str(e)}")
+
+            await waiting_msg.edit("📤 Uploading...")
 
             try:
-                # Indicate ongoing file upload to enhance user experience
                 async with client.action(event.chat_id, 'document'):
-
                     media = await fast_upload(
                         client=client,
                         file_location=path,
-                        reply=None,  # No need for a progress bar in this case
-                        name=path,
+                        reply=None,
+                        name=os.path.basename(path),
                         progress_bar_function=None
                     )
 
-                    if extension == "mp4":
-
-                        uploaded_file = await client.upload_file(media)
-
-                        # Prepare the video attributes
-                        video_attributes = DocumentAttributeVideo(
-                            duration=int(duration),
-                            w=int(width),
-                            h=int(height),
-                            supports_streaming=True,
-                            # Add other attributes as needed
+                    if format_type == "mp4":
+                        video_attr = DocumentAttributeVideo(
+                            duration=0, w=0, h=0, supports_streaming=True
                         )
-
-                        media = InputMediaUploadedDocument(
-                            file=uploaded_file,
-                            thumb=None,
-                            mime_type='video/mp4',
-                            attributes=[video_attributes],
+                        mime = "video/mp4"
+                        attributes = [video_attr]
+                    else:
+                        audio_attr = DocumentAttributeAudio(
+                            duration=0,
+                            title=title,
+                            performer="@Socialdownloader1_bot"
                         )
+                        mime = "audio/mpeg"
+                        attributes = [audio_attr]
 
-                    elif extension == "m4a" or extension == "webm":
+                    input_media = InputMediaUploadedDocument(
+                        file=await client.upload_file(media),
+                        mime_type=mime,
+                        attributes=attributes,
+                    )
 
-                        uploaded_file = await client.upload_file(media)
+                    await client.send_file(
+                        event.chat_id,
+                        file=input_media,
+                        caption=f"✅ **{title}**\n@Socialdownloader1_bot",
+                        force_document=False,
+                        supports_streaming=True
+                    )
 
-                        # Prepare the audio attributes
-                        audio_attributes = DocumentAttributeAudio(
-                            duration=int(duration),
-                            title="Downloaded Audio",  # Replace with actual title
-                            performer="@Spotify_YT_Downloader_BOT",  # Replace with actual performer
-                            # Add other attributes as needed
-                        )
-
-                        media = InputMediaUploadedDocument(
-                            file=uploaded_file,
-                            thumb=None,  # Assuming you have a thumbnail or will set it later
-                            mime_type='audio/m4a' if extension == "m4a" else 'audio/webm',
-                            attributes=[audio_attributes],
-                        )
-
-                    # Send the downloaded file
-                    await client.send_file(event.chat_id, file=media,
-                                           caption=f"Enjoy!\n@Spotify_YT_Downloader_BOT",
-                                           force_document=False,
-                                           # This ensures the file is sent as a video/voice if possible
-                                           supports_streaming=True  # This enables video streaming
-                                           )
-
-                await upload_message.delete()
-                await local_availability_message.delete() if local_availability_message else None
+                await waiting_msg.delete()
                 await db.set_file_processing_flag(user_id, is_processing=False)
 
-            except Exception as Err:
+            except Exception as e:
                 await db.set_file_processing_flag(user_id, is_processing=False)
-                return await event.respond(f"Sorry There was a problem with your request.\nReason:{str(Err)}")
+                return await event.respond(f"❌ Upload failed.\nReason: {str(e)}")
+
         else:
             await event.answer("Invalid button data.")
