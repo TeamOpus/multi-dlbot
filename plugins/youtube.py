@@ -1,9 +1,23 @@
 import aiohttp
 import asyncio
-from utils import YoutubeDL, re, lru_cache, hashlib, InputMediaPhotoExternal, db
-from utils import os, InputMediaUploadedDocument, DocumentAttributeVideo, fast_upload
-from utils import DocumentAttributeAudio, DownloadError, WebpageMediaEmptyError
+import os
+import re
+import hashlib
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+
+# yt-dlp wrapper from your utils
+from utils import YoutubeDL, InputMediaPhotoExternal, db
+from utils import InputMediaUploadedDocument, DocumentAttributeVideo, fast_upload
+from utils import DocumentAttributeAudio, WebpageMediaEmptyError
 from run import Button, Buttons
+
+# Correct import as you requested
+from py_yt import VideosSearch
+
+
+# Optionally create a shared executor for blocking calls
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 class YoutubeDownloader:
@@ -12,14 +26,16 @@ class YoutubeDownloader:
     def initialize(cls):
         cls.MAXIMUM_DOWNLOAD_SIZE_MB = 100
         cls.DOWNLOAD_DIR = 'repository/Youtube'
+        cls.COOKIES_PATH = 'resources/cookies.txt'  # path used by yt-dlp fallback
 
         if not os.path.isdir(cls.DOWNLOAD_DIR):
-            os.mkdir(cls.DOWNLOAD_DIR)
+            os.makedirs(cls.DOWNLOAD_DIR, exist_ok=True)
 
+    @staticmethod
     @lru_cache(maxsize=128)
     def get_file_path(url, format_id, extension):
-        url = url + format_id + extension
-        url_hash = hashlib.blake2b(url.encode()).hexdigest()
+        key = url + format_id + extension
+        url_hash = hashlib.blake2b(key.encode()).hexdigest()
         filename = f"{url_hash}.{extension}"
         return os.path.join(YoutubeDownloader.DOWNLOAD_DIR, filename)
 
@@ -34,8 +50,7 @@ class YoutubeDownloader:
             r'(https?\:\/\/)?www\.youtube\.com\/[^\/]+\?v=([a-zA-Z0-9_-]{11})(?!.*list=)',
         ]
         for pattern in youtube_patterns:
-            match = re.match(pattern, url)
-            if match:
+            if re.match(pattern, url):
                 return True
         return False
 
@@ -60,6 +75,94 @@ class YoutubeDownloader:
                     return f'https://www.youtube.com/watch?v={video_id}'
         return None
 
+    # --------------------------- Info fetching ------------------------------
+
+    @staticmethod
+    def _videossearch_blocking(query):
+        """
+        Blocking wrapper for VideosSearch.result() — runs in thread executor.
+        Returns results dict or raises.
+        """
+        vs = VideosSearch(query, limit=1)
+        return vs.result()
+
+    @staticmethod
+    async def fetch_video_info(url):
+        """
+        Primary: use py_yt.VideosSearch to fetch metadata (title, thumbnail, id).
+        Fallback: use yt-dlp with cookies (if available).
+        Returns: dict with keys: video_id, title, thumbnail
+        """
+        # normalize id
+        video_id = (url.split("?si=")[0]
+                    .replace("https://www.youtube.com/watch?v=", "")
+                    .replace("https://www.youtube.com/shorts/", "")
+                    .split("&")[0])
+
+        # 1) Try py_yt (VideosSearch) in executor to avoid blocking event loop
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(_executor, YoutubeDownloader._videossearch_blocking, video_id)
+            # py_yt structure: {'result': [{'id':..., 'title':..., 'thumbnails': [{'url':...}], ...}], 'total': ...}
+            if isinstance(result, dict):
+                rlist = result.get('result') or result.get('videos') or []
+                if rlist:
+                    first = rlist[0]
+                    title = first.get('title') or first.get('name') or f'YouTube Video {video_id}'
+                    vid = first.get('id') or video_id
+                    # thumbnails can be a list with dicts
+                    thumbs = first.get('thumbnails') or first.get('thumbnail') or []
+                    thumb_url = None
+                    if isinstance(thumbs, list) and len(thumbs) > 0:
+                        # choose the first available thumbnail url
+                        t0 = thumbs[0]
+                        if isinstance(t0, dict):
+                            thumb_url = t0.get('url') or t0.get('thumbnail')
+                        elif isinstance(t0, str):
+                            thumb_url = t0
+                    elif isinstance(thumbs, str):
+                        thumb_url = thumbs
+
+                    return {
+                        'video_id': vid,
+                        'title': title,
+                        'thumbnail': thumb_url
+                    }
+        except Exception:
+            # primary method failed — we'll fallback to yt-dlp below
+            pass
+
+        # 2) Fallback: use yt-dlp (with cookies support if available)
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+            }
+            # include cookiefile if exists
+            if os.path.isfile(YoutubeDownloader.COOKIES_PATH):
+                ydl_opts['cookiefile'] = YoutubeDownloader.COOKIES_PATH
+
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title') or f'YouTube Video {video_id}'
+                thumbnail = info.get('thumbnail')
+                vid = info.get('id') or video_id
+                return {
+                    'video_id': vid,
+                    'title': title,
+                    'thumbnail': thumbnail
+                }
+        except Exception as e:
+            # As a last resort return best-effort minimal info
+            return {
+                'video_id': video_id,
+                'title': f'YouTube Video ({video_id})',
+                'thumbnail': None
+            }
+
+    # --------------------------- Formats (yt-dlp) ---------------------------
+
     @staticmethod
     def _get_formats(url):
         ydl_opts = {
@@ -67,26 +170,29 @@ class YoutubeDownloader:
             'no_warnings': True,
             'quiet': True,
         }
+        # include cookiefile if available
+        if os.path.isfile(YoutubeDownloader.COOKIES_PATH):
+            ydl_opts['cookiefile'] = YoutubeDownloader.COOKIES_PATH
 
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-
-        formats = info['formats']
+        formats = info.get('formats', []) if info else []
         return formats
+
+    # --------------------------- UI / Bot flows ------------------------------
 
     @staticmethod
     async def send_youtube_info(client, event, youtube_link):
-        url = youtube_link
-        video_id = (youtube_link.split("?si=")[0]
-                    .replace("https://www.youtube.com/watch?v=", "")
-                    .replace("https://www.youtube.com/shorts/", ""))
+        """
+        Called when a youtube link is detected; sends metadata + buttons.
+        Uses py_yt first; falls back to yt-dlp if needed.
+        """
+        info = await YoutubeDownloader.fetch_video_info(youtube_link)
+        video_id = info.get('video_id')
+        thumbnail_url = info.get('thumbnail')
+        title = info.get('title', 'Unknown Title')
 
-        with YoutubeDL({'quiet': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            thumbnail_url = info['thumbnail']
-            title = info.get('title', 'Unknown Title')
-
-        # API-based formats
+        # API-based formats buttons (keeps your previous format)
         video_buttons = [
             [Button.inline("🎬 MP4 (Video)", data=f"ytapi/{video_id}/mp4")]
         ]
@@ -97,24 +203,34 @@ class YoutubeDownloader:
         buttons = video_buttons + audio_buttons
         buttons.append(Buttons.cancel_button)
 
-        thumbnail = InputMediaPhotoExternal(thumbnail_url)
-        thumbnail.ttl_seconds = 0
+        # send thumbnail if available, otherwise simple text
+        if thumbnail_url:
+            try:
+                thumbnail = InputMediaPhotoExternal(thumbnail_url)
+                thumbnail.ttl_seconds = 0
+                await client.send_file(
+                    event.chat_id,
+                    file=thumbnail,
+                    caption=f"🎵 **{title}**\nSelect a format to download:",
+                    buttons=buttons
+                )
+                return
+            except WebpageMediaEmptyError:
+                # fallthrough to text send
+                pass
+            except Exception:
+                # non-fatal — keep going to text reply
+                pass
 
-        try:
-            await client.send_file(
-                event.chat_id,
-                file=thumbnail,
-                caption=f"🎵 **{title}**\nSelect a format to download:",
-                buttons=buttons
-            )
-        except WebpageMediaEmptyError:
-            await event.respond(
-                f"🎵 **{title}**\nSelect a format to download:",
-                buttons=buttons
-            )
+        # fallback: send plain message with buttons
+        await event.respond(f"🎵 **{title}**\nSelect a format to download:", buttons=buttons)
 
     @staticmethod
     async def download_and_send_yt_file(client, event):
+        """
+        Handles button presses like ytapi/<video_id>/<mp3|mp4>
+        Keeps your worker API download flow unchanged.
+        """
         user_id = event.sender_id
 
         if await db.get_file_processing_flag(user_id):
